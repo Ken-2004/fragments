@@ -1,0 +1,138 @@
+name: cd
+
+# Deploy a new version whenever a version tag is pushed.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'fragments' }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE || 'fragments-service' }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER || 'fragments-cluster' }}
+  ECS_LOG_GROUP: ${{ vars.ECS_LOG_GROUP || '/ecs/fragments-task' }}
+  ECS_TASK_DEFINITION: fragments-definition.json
+  CONTAINER_NAME: fragments-container
+
+jobs:
+  deploy:
+    name: Integration Tests, ECR, and ECS Deployment
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install node dependencies
+        run: npm ci
+
+      - name: Build local integration test containers
+        run: docker compose up --build -d
+
+      - name: Setup local AWS resources
+        run: sh ./scripts/local-aws-setup.sh
+
+      - name: Wait for fragments API
+        run: curl --fail --silent --show-error --retry 30 --retry-connrefused --retry-delay 2 --max-time 5 http://localhost:8080
+
+      - name: Run Hurl integration tests
+        run: npm run test:integration
+
+      - name: Show container logs if integration tests fail
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop local integration test containers
+        if: always()
+        run: docker compose down
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build once and publish both the Git version tag and latest.
+      - name: Build and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.ref_name }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          LATEST_URI="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+          docker build \
+            -t "$IMAGE_URI" \
+            -t "$LATEST_URI" \
+            .
+
+          docker push "$IMAGE_URI"
+          docker push "$LATEST_URI"
+
+          echo "image=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Amazon ECS roles and logging
+        id: prepare-task-definition
+        env:
+          AWS_ECS_TASK_ROLE_ARN: ${{ secrets.AWS_ECS_TASK_ROLE_ARN }}
+          AWS_ECS_EXECUTION_ROLE_ARN: ${{ secrets.AWS_ECS_EXECUTION_ROLE_ARN }}
+        run: |
+          : "${AWS_ECS_TASK_ROLE_ARN:?Set the AWS_ECS_TASK_ROLE_ARN secret}"
+          : "${AWS_ECS_EXECUTION_ROLE_ARN:?Set the AWS_ECS_EXECUTION_ROLE_ARN secret}"
+          TASK_DEFINITION="$RUNNER_TEMP/fragments-task-definition.json"
+          jq \
+            --arg taskRole "$AWS_ECS_TASK_ROLE_ARN" \
+            --arg executionRole "$AWS_ECS_EXECUTION_ROLE_ARN" \
+            --arg region "$AWS_REGION" \
+            --arg logGroup "$ECS_LOG_GROUP" \
+            '.taskRoleArn = $taskRole |
+             .executionRoleArn = $executionRole |
+             .containerDefinitions[].logConfiguration.options += {
+               "awslogs-region": $region,
+               "awslogs-group": $logGroup
+             }' \
+            "$ECS_TASK_DEFINITION" > "$TASK_DEFINITION"
+          echo "task-definition=$TASK_DEFINITION" >> "$GITHUB_OUTPUT"
+
+      - name: Render Amazon ECS task definition
+        id: render-task-definition
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ steps.prepare-task-definition.outputs.task-definition }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+          environment-variables: |
+            PORT=80
+            NODE_ENV=production
+            FRAGMENTS_LOG_LEVEL=info
+            AWS_REGION=${{ env.AWS_REGION }}
+            AWS_COGNITO_POOL_ID=${{ secrets.AWS_COGNITO_POOL_ID }}
+            AWS_COGNITO_CLIENT_ID=${{ secrets.AWS_COGNITO_CLIENT_ID }}
+            AWS_S3_BUCKET_NAME=${{ secrets.AWS_S3_BUCKET_NAME }}
+            AWS_DYNAMODB_TABLE_NAME=${{ secrets.AWS_DYNAMODB_TABLE_NAME }}
+            API_URL=${{ secrets.API_URL }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

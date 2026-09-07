@@ -1,0 +1,36 @@
+services:
+  fragments:
+    init: true
+    build: .
+    environment:
+      - API_URL=http://localhost:8080
+      # Basic Auth is restricted to development and tests.
+      - HTPASSWD_FILE=tests/.htpasswd
+      - FRAGMENTS_LOG_LEVEL=${FRAGMENTS_LOG_LEVEL:-info}
+      - NODE_ENV=test
+      - PORT=8080
+      - AWS_REGION=us-east-1
+      # Intentionally fake credentials, used exclusively by local AWS emulators.
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_S3_ENDPOINT_URL=http://ministack:4566
+      - AWS_DYNAMODB_ENDPOINT_URL=http://dynamodb-local:8000
+      # Local resource names; scripts/local-aws-setup.sh uses the same defaults.
+      - AWS_S3_BUCKET_NAME=${AWS_S3_BUCKET_NAME:-fragments}
+      - AWS_DYNAMODB_TABLE_NAME=${AWS_DYNAMODB_TABLE_NAME:-fragments}
+    ports:
+      - '8080:8080'
+
+  dynamodb-local:
+    image: amazon/dynamodb-local
+    ports:
+      - '8000:8000'
+    command: ['-jar', 'DynamoDBLocal.jar', '-inMemory']
+
+  ministack:
+    image: ministackorg/ministack
+    ports:
+      - '4566:4566'
+    environment:
+      - SERVICES=s3
+      - MINISTACK_REGION=us-east-1

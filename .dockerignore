@@ -1,0 +1,30 @@
+.github/
+.vscode/
+coverage/
+node_modules/
+
+# Ignore unit tests but include the Basic Auth password file
+tests/*
+!tests/.htpasswd
+
+.env
+env.jest
+eslint.config.mjs
+.git/
+.gitignore
+.prettier*
+jest*
+fragments-*.tgz
+npm-debug.log*
+
+# Local secrets and credentials
+.env
+.env.*
+.aws/
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
